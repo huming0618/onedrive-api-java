@@ -1,0 +1,20 @@
+# Copy to application.properties (gitignored) or export as environment variables.
+# Environment variables override these values (see AppConfig).
+
+# Azure AD app registration
+onedrive.clientId=YOUR_CLIENT_ID
+onedrive.tenantId=common
+# Required only for auth.mode=client_credentials
+onedrive.clientSecret=
+
+# Auth mode: device_code | client_credentials | interactive
+onedrive.auth.mode=device_code
+
+# Delegated scopes (device_code / interactive). Space-separated.
+onedrive.scopes=Files.ReadWrite User.Read offline_access
+
+# App-only: user UPN or object id whose OneDrive to access (required for client_credentials)
+onedrive.userId=
+
+# Interactive redirect (must match Azure app registration)
+onedrive.redirectUri=http://localhost
