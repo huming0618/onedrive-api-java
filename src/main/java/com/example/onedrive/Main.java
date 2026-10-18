@@ -5,14 +5,11 @@ import com.example.onedrive.client.OneDriveClient;
 import com.example.onedrive.config.AppConfig;
 import com.example.onedrive.model.DriveItemInfo;
 
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.time.Instant;
 import java.util.List;
 
 /**
- * CLI demo: authenticate → list root → upload a small file → download it back.
+ * CLI demo: authenticate → list root.
+ * Upload/download round-trip is left commented out (e.g. when quota is full).
  *
  * <pre>
  *   mvn -q package
@@ -50,6 +47,9 @@ public final class Main {
                 }
             }
 
+            // Upload/download temporarily disabled (e.g. quotaLimitReached).
+            // Uncomment when you need the round-trip demo again:
+            /*
             String remoteName = "onedrive-api-java-demo.txt";
             Path uploadLocal = Path.of("demo-upload.txt");
             Path downloadLocal = Path.of("demo-download.txt");
@@ -70,6 +70,8 @@ public final class Main {
             if (!payload.equals(roundTrip)) {
                 throw new IllegalStateException("Round-trip content mismatch");
             }
+            */
+
             System.out.println();
             System.out.println("Demo completed successfully.");
         }
