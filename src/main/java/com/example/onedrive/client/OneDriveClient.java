@@ -3,6 +3,7 @@ package com.example.onedrive.client;
 import com.example.onedrive.auth.MsalTokenProvider;
 import com.example.onedrive.config.AppConfig;
 import com.example.onedrive.model.DriveItemInfo;
+import com.example.onedrive.util.GraphException;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -22,19 +23,23 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * Thin Microsoft Graph OneDrive client: list folder, upload, download.
- * Uses Graph REST ({@code https://graph.microsoft.com/v1.0}) with MSAL tokens.
+ * Thin Microsoft Graph OneDrive client: list folder (with paging), recursive file list,
+ * upload, download. Uses Graph REST with MSAL tokens.
  */
 public final class OneDriveClient implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(OneDriveClient.class);
     private static final String GRAPH = "https://graph.microsoft.com/v1.0";
     private static final long SIMPLE_UPLOAD_LIMIT = 4L * 1024 * 1024;
+    private static final String SELECT =
+            "id,name,webUrl,size,folder,file,lastModifiedDateTime,parentReference";
 
     private final AppConfig config;
     private final MsalTokenProvider tokens;
@@ -50,29 +55,59 @@ public final class OneDriveClient implements AutoCloseable {
     }
 
     /**
-     * Lists children of a folder path under the drive root.
+     * Lists children of a folder path under the drive root (follows {@code @odata.nextLink}).
      *
      * @param path folder path relative to root, e.g. {@code ""} / {@code "/"} / {@code "Documents/Reports"}
      */
     public List<DriveItemInfo> listChildren(String path) throws IOException, InterruptedException {
-        String url = driveBase() + itemPathSegment(path) + "/children?$select=id,name,webUrl,size,folder,file";
-        JsonObject body = getJson(url);
-        JsonArray value = body.has("value") && body.get("value").isJsonArray()
-                ? body.getAsJsonArray("value")
-                : new JsonArray();
-
+        String parentPath = normalizePath(path);
+        String url = driveBase() + itemPathSegment(path) + "/children?$select=" + SELECT
+                + "&$top=200";
         List<DriveItemInfo> items = new ArrayList<>();
-        for (JsonElement el : value) {
-            JsonObject o = el.getAsJsonObject();
-            items.add(new DriveItemInfo(
-                    text(o, "id"),
-                    text(o, "name"),
-                    text(o, "webUrl"),
-                    o.has("size") && !o.get("size").isJsonNull() ? o.get("size").getAsLong() : null,
-                    o.has("folder"),
-                    o.has("file")));
+        while (url != null) {
+            JsonObject body = getJson(url);
+            JsonArray value = body.has("value") && body.get("value").isJsonArray()
+                    ? body.getAsJsonArray("value")
+                    : new JsonArray();
+            for (JsonElement el : value) {
+                items.add(toItem(el.getAsJsonObject(), parentPath));
+            }
+            url = text(body, "@odata.nextLink");
         }
         return items;
+    }
+
+    /**
+     * Recursively lists all <strong>files</strong> under {@code path} (folders are traversed, not returned).
+     * Handles Graph paging on each folder.
+     */
+    public List<DriveItemInfo> listFilesRecursive(String path) throws IOException, InterruptedException {
+        String root = normalizePath(path);
+        List<DriveItemInfo> files = new ArrayList<>();
+        Deque<String> folders = new ArrayDeque<>();
+        folders.add(root);
+
+        while (!folders.isEmpty()) {
+            String folder = folders.removeFirst();
+            List<DriveItemInfo> children = listChildren(folder.isEmpty() ? "/" : folder);
+            for (DriveItemInfo item : children) {
+                if (item.folder()) {
+                    folders.add(item.displayPath());
+                } else if (item.file()) {
+                    files.add(item);
+                }
+            }
+        }
+        return files;
+    }
+
+    /** Metadata for a single item (file or folder). */
+    public DriveItemInfo getItem(String remotePath) throws IOException, InterruptedException {
+        String remote = normalizePath(remotePath);
+        String url = driveBase() + itemPathSegment(remote) + "?$select=" + SELECT;
+        JsonObject body = getJson(url);
+        String parent = parentOf(remote);
+        return toItem(body, parent);
     }
 
     /**
@@ -82,7 +117,7 @@ public final class OneDriveClient implements AutoCloseable {
     public DriveItemInfo uploadFile(Path localPath, String remotePath) throws IOException, InterruptedException {
         Path local = localPath.toAbsolutePath().normalize();
         if (!Files.isRegularFile(local)) {
-            throw new IllegalArgumentException("Local file not found: " + local);
+            throw new IOException("Local file not found: " + local);
         }
         String remote = normalizePath(remotePath);
         if (remote.isEmpty()) {
@@ -98,31 +133,53 @@ public final class OneDriveClient implements AutoCloseable {
     }
 
     /**
-     * Downloads a remote file to {@code localPath}.
+     * Downloads a remote file to {@code localPath}. Creates parent directories.
+     *
+     * @param overwrite if false and local exists with the same size as remote, skip download
+     * @return true if a download was performed; false if skipped
      */
-    public void downloadFile(String remotePath, Path localPath) throws IOException, InterruptedException {
+    public boolean downloadFile(String remotePath, Path localPath, boolean overwrite)
+            throws IOException, InterruptedException {
         String remote = normalizePath(remotePath);
         Path local = localPath.toAbsolutePath().normalize();
         if (local.getParent() != null) {
             Files.createDirectories(local.getParent());
         }
 
+        if (!overwrite && Files.isRegularFile(local)) {
+            DriveItemInfo meta = getItem(remote);
+            Long remoteSize = meta.size();
+            long localSize = Files.size(local);
+            if (remoteSize != null && remoteSize == localSize) {
+                log.info("Skip download (same size {}): {} -> {}", localSize, remote, local);
+                return false;
+            }
+        }
+
         String url = driveBase() + itemPathSegment(remote) + "/content";
         HttpRequest request = authorized(HttpRequest.newBuilder()
                 .uri(URI.create(url))
-                .timeout(Duration.ofMinutes(5))
+                .timeout(Duration.ofMinutes(30))
                 .GET());
 
         HttpResponse<InputStream> response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
         if (response.statusCode() >= 400) {
             String err = new String(response.body().readAllBytes(), StandardCharsets.UTF_8);
-            throw new IOException("Download failed HTTP " + response.statusCode() + ": " + err);
+            throw new GraphException(response.statusCode(), url, err);
         }
 
-        try (InputStream in = response.body(); OutputStream out = Files.newOutputStream(local)) {
+        Path tmp = local.resolveSibling(local.getFileName() + ".part");
+        try (InputStream in = response.body(); OutputStream out = Files.newOutputStream(tmp)) {
             in.transferTo(out);
         }
+        Files.move(tmp, local, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         log.info("Downloaded {} -> {} ({} bytes)", remote, local, Files.size(local));
+        return true;
+    }
+
+    /** Overwrite by default (backward compatible). */
+    public void downloadFile(String remotePath, Path localPath) throws IOException, InterruptedException {
+        downloadFile(remotePath, localPath, true);
     }
 
     private DriveItemInfo simpleUpload(Path local, String remote) throws IOException, InterruptedException {
@@ -135,13 +192,12 @@ public final class OneDriveClient implements AutoCloseable {
                 .PUT(HttpRequest.BodyPublishers.ofByteArray(bytes)));
 
         JsonObject body = sendJson(request);
-        return toItem(body);
+        return toItem(body, parentOf(remote));
     }
 
     private DriveItemInfo sessionUpload(Path local, String remote, long size)
             throws IOException, InterruptedException {
-        String createUrl = driveBase() + itemPathSegment(remote)
-                + "/createUploadSession";
+        String createUrl = driveBase() + itemPathSegment(remote) + "/createUploadSession";
         String createBody = "{\"item\":{\"@microsoft.graph.conflictBehavior\":\"replace\"}}";
         HttpRequest createReq = authorized(HttpRequest.newBuilder()
                 .uri(URI.create(createUrl))
@@ -155,7 +211,6 @@ public final class OneDriveClient implements AutoCloseable {
             throw new IOException("createUploadSession did not return uploadUrl");
         }
 
-        // Single-chunk for simplicity when slightly over 4 MiB; chunk at 3.2 MiB otherwise.
         final long chunkSize = 320L * 1024 * 10; // 3.2 MiB (multiple of 320 KiB)
         byte[] buffer = new byte[(int) Math.min(chunkSize, size)];
         long offset = 0;
@@ -179,11 +234,11 @@ public final class OneDriveClient implements AutoCloseable {
                 HttpResponse<String> resp = http.send(put, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
                 int code = resp.statusCode();
                 if (code == 200 || code == 201) {
-                    completed = toItem(JsonParser.parseString(resp.body()).getAsJsonObject());
+                    completed = toItem(JsonParser.parseString(resp.body()).getAsJsonObject(), parentOf(remote));
                     break;
                 }
                 if (code != 202) {
-                    throw new IOException("Chunk upload failed HTTP " + code + ": " + resp.body());
+                    throw new GraphException(code, uploadUrl, resp.body());
                 }
                 offset += read;
             }
@@ -197,7 +252,7 @@ public final class OneDriveClient implements AutoCloseable {
     private JsonObject getJson(String url) throws IOException, InterruptedException {
         HttpRequest request = authorized(HttpRequest.newBuilder()
                 .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(60))
+                .timeout(Duration.ofSeconds(120))
                 .GET());
         return sendJson(request);
     }
@@ -207,7 +262,7 @@ public final class OneDriveClient implements AutoCloseable {
         int code = response.statusCode();
         String body = response.body() == null ? "" : response.body();
         if (code >= 400) {
-            throw new IOException("Graph HTTP " + code + " for " + request.uri() + ": " + body);
+            throw new GraphException(code, request.uri().toString(), body);
         }
         if (body.isBlank()) {
             return new JsonObject();
@@ -221,9 +276,6 @@ public final class OneDriveClient implements AutoCloseable {
                 .build();
     }
 
-    /**
-     * Drive root base: {@code /me/drive} (delegated) or {@code /users/{id}/drive} (app-only).
-     */
     private String driveBase() {
         if (config.isAppOnly()) {
             return GRAPH + "/users/" + encodePathSegment(config.userId()) + "/drive";
@@ -231,9 +283,6 @@ public final class OneDriveClient implements AutoCloseable {
         return GRAPH + "/me/drive";
     }
 
-    /**
-     * {@code /root} or {@code /root:/path:} Graph path addressing.
-     */
     private static String itemPathSegment(String path) {
         String normalized = normalizePath(path);
         if (normalized.isEmpty()) {
@@ -242,7 +291,6 @@ public final class OneDriveClient implements AutoCloseable {
         return "/root:/" + encodeItemPath(normalized) + ":";
     }
 
-    /** Encode each path segment but keep {@code /} separators. */
     private static String encodeItemPath(String path) {
         String[] parts = path.split("/");
         StringBuilder sb = new StringBuilder();
@@ -267,31 +315,77 @@ public final class OneDriveClient implements AutoCloseable {
         while (p.startsWith("/")) {
             p = p.substring(1);
         }
-        while (p.endsWith("/") && p.length() > 1) {
+        while (p.endsWith("/") && !p.isEmpty()) {
             p = p.substring(0, p.length() - 1);
         }
-        if ("/".equals(p) || ".".equals(p)) {
+        if (".".equals(p)) {
             return "";
         }
         return p;
+    }
+
+    private static String parentOf(String remote) {
+        String n = normalizePath(remote);
+        int idx = n.lastIndexOf('/');
+        if (idx < 0) {
+            return "";
+        }
+        return n.substring(0, idx);
+    }
+
+    private static String joinPath(String parent, String name) {
+        if (name == null || name.isBlank()) {
+            return parent == null ? "" : parent;
+        }
+        if (parent == null || parent.isBlank()) {
+            return name;
+        }
+        return parent + "/" + name;
     }
 
     private static String text(JsonObject o, String field) {
         return o.has(field) && !o.get(field).isJsonNull() ? o.get(field).getAsString() : null;
     }
 
-    private static DriveItemInfo toItem(JsonObject o) {
+    private static DriveItemInfo toItem(JsonObject o, String parentFolderPath) {
+        String name = text(o, "name");
+        String pathFromParent = joinPath(parentFolderPath, name);
+
+        // Prefer Graph parentReference.path when present: "/drive/root:/Documents"
+        String path = pathFromParent;
+        if (o.has("parentReference") && o.get("parentReference").isJsonObject()) {
+            JsonObject pr = o.getAsJsonObject("parentReference");
+            String prPath = text(pr, "path");
+            if (prPath != null) {
+                String relative = stripDriveRootPrefix(prPath);
+                path = joinPath(relative, name);
+            }
+        }
+
         return new DriveItemInfo(
                 text(o, "id"),
-                text(o, "name"),
+                name,
+                path,
                 text(o, "webUrl"),
                 o.has("size") && !o.get("size").isJsonNull() ? o.get("size").getAsLong() : null,
+                text(o, "lastModifiedDateTime"),
                 o.has("folder"),
                 o.has("file"));
     }
 
+    /** Convert {@code /drive/root:} or {@code /drive/root:/Documents} to relative path. */
+    private static String stripDriveRootPrefix(String prPath) {
+        String p = prPath;
+        final String marker = "/root:";
+        int idx = p.indexOf(marker);
+        if (idx >= 0) {
+            p = p.substring(idx + marker.length());
+        }
+        return normalizePath(p);
+    }
+
     @Override
     public void close() {
-        // HttpClient does not require explicit close on modern JDKs; placeholder for AutoCloseable.
+        // HttpClient does not require explicit close on modern JDKs.
     }
 }

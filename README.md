@@ -1,12 +1,15 @@
 # onedrive-api-java
 
-基于 **MSAL4J** + **Microsoft Graph REST**（`java.net.http`）的精简 OneDrive Java 客户端。
+基于 **MSAL4J** + **Microsoft Graph REST**（`java.net.http`）的 OneDrive Java 客户端与命令行工具。
 
 支持：
 
-- 列出文件夹内容 `listChildren(path)`
-- 上传文件 `uploadFile(localPath, remotePath)`（≤4MiB 简单上传；更大文件使用 upload session）
-- 下载文件 `downloadFile(remotePath, localPath)`
+- CLI：`auth` / `ls` / `ls-recursive` / `download` / `upload`
+- 列出文件夹（自动跟随 `@odata.nextLink` 分页）
+- 递归列出全部文件
+- 上传（≤4MiB 简单上传；更大文件 upload session）
+- 下载（可跳过同大小本地文件；断点友好）
+- 持久化 MSAL 令牌缓存（脚本连续调用不必每次扫设备码）
 
 认证方式（可配置）：
 
@@ -16,7 +19,7 @@
 | 客户端凭据（守护进程） | `client_credentials` | 需 `clientSecret` + `userId`，应用权限 |
 | 交互式浏览器 | `interactive` | 本机打开浏览器登录 |
 
-包结构：`com.example.onedrive`（`config` / `auth` / `client` / `model`）。
+包结构：`com.example.onedrive`（`config` / `auth` / `client` / `model` / `cli` / `util`）。
 
 ---
 
@@ -33,13 +36,13 @@
    - **重定向 URI**：可先留空（设备码流不强制）；若稍后用交互式浏览器登录，平台选「移动和桌面应用程序」并加 `http://localhost`。
 3. 注册完成后，在「概述」页复制：
    - **应用程序(客户端) ID** → 环境变量 `ONEDRIVE_CLIENT_ID`
-   - **目录(租户) ID** → `ONEDRIVE_TENANT_ID`（多租户/个人演示可直接用 `common`）
+   - **目录(租户) ID** → `ONEDRIVE_TENANT_ID`（多租户/个人演示可直接用 `common` 或 `consumers`）
 4. **API 权限** → **添加权限** → **Microsoft Graph** → **委托的权限**，勾选：
    - `Files.ReadWrite`（必需）
-   - `User.Read`、`offline_access`（可选）
+   - `User.Read`、`offline_access`（推荐；`offline_access` 利于刷新令牌）
    个人账号一般点「添加」即可；公司租户若要求管理员同意，再点 **授予管理员同意**。
-5. **身份验证** → **高级设置** → **允许公共客户端流** 设为 **是**（设备码登录必需）。
-6. **不需要**客户端密码（`clientSecret`）。把 `ONEDRIVE_AUTH_MODE=device_code`，运行程序后按终端里的 `https://microsoft.com/devicelogin` 提示用浏览器登录即可。
+5. **身份验证** → **高级设置** → **允许公共客户端流** 设为 **是**（设备码登录必需）。可再添加平台「移动应用程序和桌面应用程序」。
+6. **不需要**客户端密码（`clientSecret`）。把 `ONEDRIVE_AUTH_MODE=device_code`，运行 `auth` 后按 **stderr** 里的 `https://microsoft.com/devicelogin` 提示用浏览器登录即可。
 
 ### 1.2 其它注册要点（简表）
 
@@ -60,7 +63,7 @@
 2. 勾选：
    - `Files.ReadWrite`（读写用户 OneDrive）
    - `User.Read`（可选，便于确认登录用户）
-   - `offline_access`（刷新令牌，可选）
+   - `offline_access`（刷新令牌，建议打开）
 3. 若租户要求管理员同意，点击 **为 [租户] 授予管理员同意**。
 4. **身份验证** → 高级设置 → 允许公共客户端流：**是**（设备码需要）。
 
@@ -69,7 +72,7 @@
 1. **API 权限** → **Microsoft Graph** → **应用程序权限**
 2. 添加 `Files.ReadWrite.All`（或更细粒度的 Sites/Files 权限），并 **授予管理员同意**。
 3. **证书和密码** → 新建客户端密码 → 记下密钥值 → `clientSecret`。
-4. 配置 `onedrive.userId` 为要访问的用户 **UPN** 或 **对象 ID**（应用身份不能用 `/me`）。
+4. 配置 `onedrive.userId` 为要访问的用户 **UPN** 或 **对象 ID**（应用身份不能用 `/me`）。目标租户还需具备 SharePoint Online / OneDrive 许可。
 
 ---
 
@@ -81,8 +84,10 @@
 
 ```bash
 export ONEDRIVE_CLIENT_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-export ONEDRIVE_TENANT_ID="common"          # 或你的租户 GUID
+export ONEDRIVE_TENANT_ID="consumers"       # 个人账号常用；也可用 common
 export ONEDRIVE_AUTH_MODE="device_code"     # device_code | client_credentials | interactive
+# 可选：自定义令牌缓存路径
+# export ONEDRIVE_TOKEN_CACHE="$HOME/.onedrive-api-java/token_cache.json"
 # client_credentials 时还需要：
 # export ONEDRIVE_CLIENT_SECRET="..."
 # export ONEDRIVE_USER_ID="user@contoso.com"
@@ -108,45 +113,144 @@ onedrive.scopes=Files.ReadWrite User.Read offline_access
 
 环境变量优先级高于属性文件。
 
+### 令牌缓存（脚本必读）
+
+首次 `device_code` / `interactive` 登录成功后，MSAL 缓存写入：
+
+- 默认：`~/.onedrive-api-java/token_cache.json`
+- 覆盖：环境变量 `ONEDRIVE_TOKEN_CACHE`
+
+之后每次 CLI 调用会先 **静默刷新**，不必重新扫码。删除该文件即可强制重新登录。
+
 ---
 
-## 3. 构建与运行
+## 3. 构建
 
 要求：**JDK 17+**、Maven 3.8+。
 
 ```bash
-cd /workspace/onedrive-api-java
-
-# 下载依赖并编译打包（含可执行 fat-jar）
+cd onedrive-api-java
 mvn -q package
-
-# 运行演示：登录 → 列出根目录 → 上传 demo-upload.txt → 下载为 demo-download.txt
-mvn -q exec:java
-
-# 或使用 shade jar
-java -jar target/onedrive-api-java-1.0.0.jar
+# 产物：target/onedrive-api-java-1.0.0.jar（shade 可执行包）
 ```
-
-设备码模式下，终端会打印类似：
-
-```text
-To sign in, use a web browser to open the page https://microsoft.com/devicelogin
-and enter the code XXXXXXXX to authenticate.
-```
-
-按提示在浏览器完成登录后，演示会继续执行。
 
 ---
 
-## 4. 在代码中使用
+## 4. 命令行用法
+
+```text
+java -jar target/onedrive-api-java-1.0.0.jar [全局选项] <命令> [参数]
+```
+
+### 全局选项
+
+| 选项 | 说明 |
+|------|------|
+| `--json` | stdout 每行一个 JSON 对象（NDJSON），便于脚本/`jq` 解析 |
+| `--tsv` | stdout 制表符分隔：`path size id lastModified kind name`（路径可含空格，勿用空格分隔） |
+| `--help` / `-h` | 帮助 |
+
+**约定：** 业务结果写 **stdout**；设备码提示、进度、日志、错误写 **stderr**。
+
+### 命令
+
+| 命令 | 说明 |
+|------|------|
+| `auth` | 登录 / 刷新令牌，打印账号与缓存路径 |
+| `ls [remotePath]` | 列出目录子项（默认 `/`） |
+| `ls-recursive` / `tree` `[remotePath]` | 递归列出全部**文件**（含分页） |
+| `download [--overwrite\|--skip-same-size] <remote> <local>` | 下载；默认同大小则跳过 |
+| `upload <local> <remote>` | 上传到远端路径（含文件名） |
+
+### 退出码
+
+| 码 | 含义 |
+|----|------|
+| 0 | 成功 |
+| 1 | 用法 / 参数错误 |
+| 2 | 认证或配置错误（缺 clientId、登录失败等） |
+| 3 | Graph / API 错误（NotFound、quotaLimitReached 等） |
+| 4 | 本地 I/O 错误 |
+
+### 示例
+
+```bash
+# 首次登录（设备码出现在 stderr）
+java -jar target/onedrive-api-java-1.0.0.jar auth
+
+# 列根目录
+java -jar target/onedrive-api-java-1.0.0.jar ls /
+
+# 递归列出（脚本友好）
+java -jar target/onedrive-api-java-1.0.0.jar --tsv ls-recursive /
+java -jar target/onedrive-api-java-1.0.0.jar --json ls-recursive Documents
+
+# 下载 / 上传
+java -jar target/onedrive-api-java-1.0.0.jar download "Photos/a.jpg" ./a.jpg
+java -jar target/onedrive-api-java-1.0.0.jar download --overwrite "Photos/a.jpg" ./a.jpg
+java -jar target/onedrive-api-java-1.0.0.jar upload ./report.pdf Documents/report.pdf
+```
+
+Windows（PowerShell）同样可用：
+
+```powershell
+java -jar .\target\onedrive-api-java-1.0.0.jar auth
+java -jar .\target\onedrive-api-java-1.0.0.jar --tsv ls-recursive /
+```
+
+---
+
+## 5. 批量同步脚本（断点续传）
+
+将 OneDrive 上（某个目录下）的**全部文件**拷到本地，保留相对路径；失败不中断；进度写入状态目录，可再次运行续传。
+
+状态目录：`<目标目录>/.onedrive-sync/`
+
+| 文件 | 作用 |
+|------|------|
+| `manifest.tsv` | 远端文件清单（`--tsv ls-recursive`） |
+| `done.txt` | 已成功（或已跳过完成）的远端路径 |
+| `failed.txt` | 本轮失败路径与错误信息 |
+
+### Bash
+
+```bash
+# 可选
+export ONEDRIVE_JAR=/path/to/onedrive-api-java-1.0.0.jar
+export ONEDRIVE_JAVA=java
+
+# 同步整个网盘到本地目录
+./scripts/onedrive-sync.sh /data/onedrive-backup
+
+# 只同步 Documents，并强制刷新清单
+ONEDRIVE_REFRESH_MANIFEST=1 ./scripts/onedrive-sync.sh /data/backup Documents
+```
+
+进度示例（stderr）：`[123/4567] 2.7% Photos/a.jpg (102400 bytes)`
+
+### PowerShell（Windows）
+
+```powershell
+$env:ONEDRIVE_JAR = "C:\path\to\onedrive-api-java-1.0.0.jar"
+
+.\scripts\onedrive-sync.ps1 -Dest D:\OneDriveBackup
+.\scripts\onedrive-sync.ps1 -Dest D:\Backup -RemoteRoot Documents -RefreshManifest
+```
+
+有失败时脚本以非 0 退出（一般为 3）；修好问题后用同一命令再跑即可跳过 `done.txt` 中的路径。
+
+---
+
+## 6. 在代码中使用
 
 ```java
 AppConfig config = AppConfig.load();
 MsalTokenProvider tokens = new MsalTokenProvider(config);
 try (OneDriveClient client = new OneDriveClient(config, tokens)) {
     List<DriveItemInfo> items = client.listChildren("Documents");
+    List<DriveItemInfo> allFiles = client.listFilesRecursive("/");
     client.uploadFile(Path.of("report.pdf"), "Documents/report.pdf");
-    client.downloadFile("Documents/report.pdf", Path.of("/tmp/report.pdf"));
+    client.downloadFile("Documents/report.pdf", Path.of("/tmp/report.pdf"), false);
 }
 ```
 
@@ -154,28 +258,38 @@ try (OneDriveClient client = new OneDriveClient(config, tokens)) {
 
 ---
 
-## 5. 项目结构
+## 7. 项目结构
 
 ```text
 onedrive-api-java/
 ├── pom.xml
 ├── README.md
 ├── .gitignore
+├── scripts/
+│   ├── onedrive-sync.sh      # Bash 全量同步 + 断点续传
+│   └── onedrive-sync.ps1     # PowerShell 等价脚本
 └── src/main/
     ├── java/com/example/onedrive/
-    │   ├── Main.java                 # CLI 演示
-    │   ├── auth/MsalTokenProvider.java
+    │   ├── Main.java                    # CLI 入口
+    │   ├── auth/MsalTokenProvider.java  # MSAL + 文件令牌缓存
+    │   ├── auth/FileTokenCacheAspect.java
     │   ├── client/OneDriveClient.java
     │   ├── config/AppConfig.java
-    │   └── model/DriveItemInfo.java
-    └── resources/application.properties.example
+    │   ├── model/DriveItemInfo.java
+    │   ├── cli/ExitCodes.java
+    │   └── util/GraphException.java
+    └── resources/
+        ├── application.properties.example
+        └── simplelogger.properties
 ```
 
 ---
 
-## 6. 说明与限制
+## 8. 说明与限制
 
-- 使用官方 **MSAL4J** 获取令牌；Graph 调用走 REST（避免引入重量级 Graph SDK / Kiota，便于精简依赖）。
-- `client_credentials` 必须配置目标用户 `userId`，并授予应用级 Files 权限。
+- 使用官方 **MSAL4J** 获取令牌；Graph 调用走 REST（避免重量级 Graph SDK）。
+- `client_credentials` 必须配置目标用户 `userId`，并授予应用级 Files 权限；租户还需 SPO/OneDrive 许可。
+- 个人 OneDrive 容量满时上传会返回 `quotaLimitReached`（HTTP 507）。
 - 简单上传上限约 4 MiB；更大文件自动走 `createUploadSession`。
 - 本仓库不含真实密钥；请使用 env / 本地 `application.properties`。
+- 同步脚本依赖本机已配置好的 `ONEDRIVE_CLIENT_ID` 等，且建议先跑一次 `auth`。
