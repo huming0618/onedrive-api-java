@@ -23,6 +23,69 @@
 
 ---
 
+## 快速上手（5 步）
+
+以 Windows + PowerShell、个人微软账号为例（Linux/macOS 把路径换成 `/` 即可）。
+
+**第 1 步：准备环境**  
+安装 JDK 17+ 和 Maven 3.8+，确认 `java -version`、`mvn -v` 能运行。
+
+**第 2 步：注册应用拿 clientId**  
+按下文「1.1 免费路径」注册，记下 **应用程序(客户端) ID**，并在「身份验证」里把 **允许公共客户端流** 设为 **是**。
+
+**第 3 步：设置环境变量并编译**
+
+```powershell
+git clone https://github.com/huming0618/onedrive-api-java.git
+cd onedrive-api-java
+$env:ONEDRIVE_CLIENT_ID = "你的客户端ID"
+$env:ONEDRIVE_TENANT_ID = "consumers"     # 个人账号；工作账号填租户ID或 common
+$env:ONEDRIVE_AUTH_MODE = "device_code"
+mvn -q package
+```
+
+想长期生效可用 `setx ONEDRIVE_CLIENT_ID "你的客户端ID"`（新开的终端才生效）。
+
+**第 4 步：首次登录**
+
+```powershell
+java -jar .\target\onedrive-api-java-1.0.0.jar auth
+```
+
+终端会提示打开 `https://microsoft.com/devicelogin` 并输入一串代码，浏览器登录后命令返回 0。令牌会缓存，后续命令和脚本不必再登录。
+
+**第 5 步：查看与下载**
+
+```powershell
+# 看根目录
+java -jar .\target\onedrive-api-java-1.0.0.jar ls /
+# 下载单个文件
+java -jar .\target\onedrive-api-java-1.0.0.jar download "Documents/a.pdf" D:\tmp\a.pdf
+# 整盘（或某个目录）批量拷贝，可中断后续传
+.\scripts\onedrive-sync.ps1 -Dest D:\OneDriveBackup
+```
+
+若提示脚本无法运行（执行策略限制），在当前窗口先执行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+**在自己的脚本里调用时：** 结果读 stdout（建议加 `--json` 或 `--tsv`），错误读 stderr，并用 `$LASTEXITCODE`（Bash 用 `$?`）判断成败，含义见「退出码」。
+
+### 常见报错
+
+| 报错 | 原因与处理 |
+|------|-----------|
+| `AADSTS70002 ... must be marked as 'mobile'` | 应用注册 → 身份验证 → 允许公共客户端流设为「是」，并添加「移动和桌面应用程序」平台 |
+| `Tenant does not have a SPO license` | 工作/学校租户没有 OneDrive for Business 许可；改用个人账号 + `consumers` |
+| `User not found`（client_credentials） | `userId` 不是本租户里的用户；个人使用请改设备码模式 |
+| `quotaLimitReached`（HTTP 507） | OneDrive 空间已满，只影响上传；清理空间后再上传 |
+| `localhost/?error=invalid_request` | 交互式登录配置不对；改用 `device_code` |
+| 每次都要求登录 | 检查 `~/.onedrive-api-java/token_cache.json` 是否可写，或 `ONEDRIVE_TOKEN_CACHE` 指向的路径 |
+
+---
+
 ## 1. Azure 应用注册（免费）
 
 **费用说明：** 注册应用、拿到 `clientId` **本身不收费**。这里不是「买 API Key」，而是在 Microsoft Entra ID（原 Azure AD）里创建一个应用身份。用个人微软账号（Outlook / Hotmail / Xbox 等）或免费 Azure 账号即可。本项目推荐的 **设备码登录 + 委托权限 `Files.ReadWrite`** 只访问你自己登录的那份 OneDrive，正常个人读写一般不会产生 Graph 按次账单。只有开通付费 Azure 订阅、使用企业应用权限去管别人的网盘、或叠加其它付费 Azure 服务时，才可能产生费用。
