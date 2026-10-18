@@ -43,3 +43,7 @@ Thumbs.db
 demo-upload.txt
 demo-download.txt
 *.log
+
+# Local token / sync state copies
+token_cache.json
+.onedrive-sync/
