@@ -87,6 +87,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 | 每次都要求登录 | 检查 `~/.onedrive-api-java/token_cache.json` 是否可写，或 `ONEDRIVE_TOKEN_CACHE` 指向的路径 |
 | `/usr/bin/env: "bash\r": 没有那个文件或目录` | `onedrive-sync.sh` 是 CRLF（Windows 换行）；执行 `sed -i 's/\r$//' scripts/onedrive-sync.sh` 后再用 bash 跑 |
 | `set: pipefail` / `无效的选项名` | 用了 `sh` 而不是 `bash`；改为 `bash scripts/onedrive-sync.sh ...` |
+| `I/O error: request timed out`（`ls-recursive`） | Graph 请求超时；客户端会对超时/429/5xx **自动重试最多 5 次**，并在 stderr 打印列举进度。仍失败时可先同步子目录，或检查到 `graph.microsoft.com` 的网络 |
 
 ---
 

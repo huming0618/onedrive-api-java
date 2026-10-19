@@ -19,6 +19,7 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -86,10 +87,17 @@ public final class OneDriveClient implements AutoCloseable {
         List<DriveItemInfo> files = new ArrayList<>();
         Deque<String> folders = new ArrayDeque<>();
         folders.add(root);
+        int foldersDone = 0;
 
         while (!folders.isEmpty()) {
             String folder = folders.removeFirst();
+            String label = folder.isEmpty() ? "/" : folder;
+            log.info("Listing folder ({}/{} queued after this): {}", foldersDone + 1, folders.size(), label);
+            // stderr progress for CLI/scripts (logger may be quiet)
+            System.err.printf("Listing [%d done, %d queued] %s%n", foldersDone, folders.size(), label);
+
             List<DriveItemInfo> children = listChildren(folder.isEmpty() ? "/" : folder);
+            foldersDone++;
             for (DriveItemInfo item : children) {
                 if (item.folder()) {
                     folders.add(item.displayPath());
@@ -97,7 +105,13 @@ public final class OneDriveClient implements AutoCloseable {
                     files.add(item);
                 }
             }
+            if (foldersDone % 10 == 0 || folders.isEmpty()) {
+                System.err.printf(
+                        "Listing progress: folders=%d files=%d still_queued=%d%n",
+                        foldersDone, files.size(), folders.size());
+            }
         }
+        System.err.printf("Listing complete: %d folders, %d files%n", foldersDone, files.size());
         return files;
     }
 
@@ -249,25 +263,86 @@ public final class OneDriveClient implements AutoCloseable {
         }
     }
 
+    private static final int MAX_RETRIES = 5;
+    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(180);
+
     private JsonObject getJson(String url) throws IOException, InterruptedException {
         HttpRequest request = authorized(HttpRequest.newBuilder()
                 .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(120))
+                .timeout(REQUEST_TIMEOUT)
                 .GET());
-        return sendJson(request);
+        return sendJsonWithRetry(request);
     }
 
     private JsonObject sendJson(HttpRequest request) throws IOException, InterruptedException {
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        int code = response.statusCode();
-        String body = response.body() == null ? "" : response.body();
-        if (code >= 400) {
-            throw new GraphException(code, request.uri().toString(), body);
+        return sendJsonWithRetry(request);
+    }
+
+    /**
+     * Sends a Graph JSON request with retries on timeouts, transient I/O errors,
+     * and HTTP 429 / 502 / 503 / 504.
+     */
+    private JsonObject sendJsonWithRetry(HttpRequest request) throws IOException, InterruptedException {
+        IOException lastIo = null;
+        GraphException lastGraph = null;
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                HttpResponse<String> response = http.send(
+                        request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                int code = response.statusCode();
+                String body = response.body() == null ? "" : response.body();
+                if (code == 429 || code == 502 || code == 503 || code == 504) {
+                    lastGraph = new GraphException(code, request.uri().toString(), body);
+                    long sleepMs = backoffMs(attempt, response.headers().firstValue("Retry-After").orElse(null));
+                    log.warn("Graph HTTP {} (attempt {}/{}), retry in {} ms: {}",
+                            code, attempt, MAX_RETRIES, sleepMs, request.uri());
+                    System.err.printf("WARN: Graph HTTP %d, retry %d/%d in %d ms%n",
+                            code, attempt, MAX_RETRIES, sleepMs);
+                    Thread.sleep(sleepMs);
+                    continue;
+                }
+                if (code >= 400) {
+                    throw new GraphException(code, request.uri().toString(), body);
+                }
+                if (body.isBlank()) {
+                    return new JsonObject();
+                }
+                return JsonParser.parseString(body).getAsJsonObject();
+            } catch (HttpTimeoutException e) {
+                lastIo = e;
+                long sleepMs = backoffMs(attempt, null);
+                log.warn("Request timed out (attempt {}/{}), retry in {} ms: {}",
+                        attempt, MAX_RETRIES, sleepMs, request.uri());
+                System.err.printf("WARN: request timed out, retry %d/%d in %d ms%n",
+                        attempt, MAX_RETRIES, sleepMs);
+                Thread.sleep(sleepMs);
+            } catch (IOException e) {
+                lastIo = e;
+                long sleepMs = backoffMs(attempt, null);
+                log.warn("I/O error (attempt {}/{}), retry in {} ms: {} — {}",
+                        attempt, MAX_RETRIES, sleepMs, request.uri(), e.getMessage());
+                System.err.printf("WARN: I/O error (%s), retry %d/%d in %d ms%n",
+                        e.getMessage(), attempt, MAX_RETRIES, sleepMs);
+                Thread.sleep(sleepMs);
+            }
         }
-        if (body.isBlank()) {
-            return new JsonObject();
+        if (lastGraph != null) {
+            throw lastGraph;
         }
-        return JsonParser.parseString(body).getAsJsonObject();
+        throw new IOException("Graph request failed after " + MAX_RETRIES + " attempts: "
+                + request.uri(), lastIo);
+    }
+
+    private static long backoffMs(int attempt, String retryAfterHeader) {
+        if (retryAfterHeader != null && !retryAfterHeader.isBlank()) {
+            try {
+                return Math.max(1000L, Long.parseLong(retryAfterHeader.trim()) * 1000L);
+            } catch (NumberFormatException ignored) {
+                // fall through to exponential backoff
+            }
+        }
+        // 2s, 4s, 8s, 16s, 32s (capped)
+        return Math.min(32_000L, 1000L * (1L << attempt));
     }
 
     private HttpRequest authorized(HttpRequest.Builder builder) {
