@@ -61,8 +61,10 @@ java -jar .\target\onedrive-api-java-1.0.0.jar auth
 java -jar .\target\onedrive-api-java-1.0.0.jar ls /
 # 下载单个文件
 java -jar .\target\onedrive-api-java-1.0.0.jar download "Documents/a.pdf" D:\tmp\a.pdf
-# 整盘（或某个目录）批量拷贝，可中断后续传
+# 整盘（或某个目录）批量拷贝，可中断后续传；结束后自动输出校验报告
 .\scripts\onedrive-sync.ps1 -Dest D:\OneDriveBackup
+# 之后随时只做校验（不下载）
+.\scripts\onedrive-sync.ps1 -Dest D:\OneDriveBackup -VerifyOnly
 ```
 
 若提示脚本无法运行（执行策略限制），在当前窗口先执行：
@@ -263,44 +265,111 @@ java -jar .\target\onedrive-api-java-1.0.0.jar --tsv ls-recursive /
 
 ---
 
-## 5. 批量同步脚本（断点续传）
+## 5. 批量同步脚本（断点续传 + 校验报告）
 
-将 OneDrive 上（某个目录下）的**全部文件**拷到本地，保留相对路径；失败不中断；进度写入状态目录，可再次运行续传。
+将 OneDrive 上（某个目录下）的**全部文件**拷到本地，保留相对路径；失败不中断；进度写入状态目录，可再次运行续传。下载结束后会自动生成**校验报告**，对比本地与远端的文件数和总字节数。
 
 状态目录：`<目标目录>/.onedrive-sync/`
 
 | 文件 | 作用 |
 |------|------|
-| `manifest.tsv` | 远端文件清单（`--tsv ls-recursive`） |
+| `manifest.tsv` | 远端文件清单（`--tsv ls-recursive`），校验时作为「远端」基准 |
 | `done.txt` | 已成功（或已跳过完成）的远端路径 |
-| `failed.txt` | 本轮失败路径与错误信息 |
+| `failed.txt` | 本轮下载失败的路径与错误信息 |
+| `verify-report.txt` | 最近一次校验报告（含时间） |
+| `missing.txt` | 清单里有、本地没有的文件：`路径<TAB>远端大小` |
+| `size-mismatch.txt` | 本地存在但大小不一致：`路径<TAB>远端大小<TAB>本地大小` |
+| `extra.txt` | 本地有、清单里没有的文件（仅供参考，不影响结果；已排除 `.onedrive-sync`） |
 
 ### Bash
+
+需要 Bash 4+（macOS 自带 3.2，请 `brew install bash`）。路径可含空格和中文。
 
 ```bash
 # 可选
 export ONEDRIVE_JAR=/path/to/onedrive-api-java-1.0.0.jar
 export ONEDRIVE_JAVA=java
 
-# 同步整个网盘到本地目录
-./scripts/onedrive-sync.sh /data/onedrive-backup
+# 同步整个网盘到本地目录（结束后自动校验）
+bash scripts/onedrive-sync.sh /data/onedrive-backup
 
 # 只同步 Documents，并强制刷新清单
-ONEDRIVE_REFRESH_MANIFEST=1 ./scripts/onedrive-sync.sh /data/backup Documents
+ONEDRIVE_REFRESH_MANIFEST=1 bash scripts/onedrive-sync.sh /data/backup Documents
+
+# 只校验，不下载（用已有 manifest.tsv，不需要 Java / 登录）
+bash scripts/onedrive-sync.sh --verify-only /data/onedrive-backup
+ONEDRIVE_VERIFY_ONLY=1 bash scripts/onedrive-sync.sh /data/onedrive-backup
 ```
 
 进度示例（stderr）：`[123/4567] 2.7% Photos/a.jpg (102400 bytes)`
 
 ### PowerShell（Windows）
 
+兼容 Windows PowerShell 5.1 与 PowerShell 7+。
+
 ```powershell
 $env:ONEDRIVE_JAR = "C:\path\to\onedrive-api-java-1.0.0.jar"
 
 .\scripts\onedrive-sync.ps1 -Dest D:\OneDriveBackup
 .\scripts\onedrive-sync.ps1 -Dest D:\Backup -RemoteRoot Documents -RefreshManifest
+
+# 只校验，不下载
+.\scripts\onedrive-sync.ps1 -Dest D:\OneDriveBackup -VerifyOnly
 ```
 
-有失败时脚本以非 0 退出（一般为 3）；修好问题后用同一命令再跑即可跳过 `done.txt` 中的路径。
+若提示脚本无法运行（执行策略限制），先在当前窗口执行 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`。
+
+### 校验报告
+
+校验逐个检查 `manifest.tsv` 里的文件在本地是否存在、实际大小是否与远端一致，并给出：
+
+- 远端文件数与总大小（来自清单）
+- 本地已存在的文件数与实际总大小
+- 校验通过（存在且大小一致）的文件数与大小，以及按数量、按字节的完成百分比
+- 缺失文件数、大小不一致文件数（前 10 条直接列出，完整列表见 `missing.txt` / `size-mismatch.txt`）
+- 本地多出的文件（仅提示）
+- 最后一行结论：`RESULT: PASS`（文件数和字节数都对上，无缺失、无大小不一致）或 `RESULT: FAIL`
+
+报告同时打印到控制台（Bash 为 stderr）并保存到 `verify-report.txt`。示例：
+
+```text
+===== OneDrive sync verification report =====
+Time:        2026-10-19 20:55:48 CST
+Destination: /data/onedrive-backup
+Manifest:    /data/onedrive-backup/.onedrive-sync/manifest.tsv
+
+Remote (manifest): 4 files, 1.40 GB (1503002053 bytes)
+Local present:     3 files, 2.10 KB (2153 bytes)
+Verified OK:       2 files, 2.00 KB (2053 bytes)
+Complete:          50.0% by count, 0.0% by bytes
+
+Missing:           1 files, 1.40 GB (1500000000 bytes)  -> .../missing.txt
+Size mismatch:     1 files  -> .../size-mismatch.txt
+Extra local (info): 1 files, 6 B (6 bytes)  -> .../extra.txt
+
+First missing files:
+  - Photos/missing one.png (1500000000 bytes)
+
+First size mismatches (remote -> local):
+  - Photos/big.jpg (3000000 -> 100 bytes)
+
+RESULT: FAIL
+=============================================
+```
+
+大小单位按 1024 进位（1 GB = 1024³ 字节），括号内为精确字节数。远端清单是生成 `manifest.tsv` 时的快照；网盘内容之后有变化时，先用 `ONEDRIVE_REFRESH_MANIFEST=1` / `-RefreshManifest` 重新同步一次再校验。
+
+### 脚本退出码
+
+| 码 | 含义 |
+|----|------|
+| 0 | 全部成功：无下载失败，且校验 PASS |
+| 1 | 用法错误、找不到 jar，或 `--verify-only` 时没有 `manifest.tsv` |
+| 2 | 登录 / 认证失败 |
+| 3 | 有文件下载失败（**优先于 5**：既有下载失败又校验 FAIL 时返回 3） |
+| 5 | 校验 FAIL（有缺失或大小不一致） |
+
+有失败时，修好问题后用同一命令再跑即可跳过 `done.txt` 中的路径，结束后会重新校验。
 
 ---
 
@@ -329,7 +398,7 @@ onedrive-api-java/
 ├── README.md
 ├── .gitignore
 ├── scripts/
-│   ├── onedrive-sync.sh      # Bash 全量同步 + 断点续传
+│   ├── onedrive-sync.sh      # Bash 全量同步 + 断点续传 + 校验报告
 │   └── onedrive-sync.ps1     # PowerShell 等价脚本
 └── src/main/
     ├── java/com/example/onedrive/
