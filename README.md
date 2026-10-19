@@ -85,6 +85,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 | `quotaLimitReached`（HTTP 507） | OneDrive 空间已满，只影响上传；清理空间后再上传 |
 | `localhost/?error=invalid_request` | 交互式登录配置不对；改用 `device_code` |
 | 每次都要求登录 | 检查 `~/.onedrive-api-java/token_cache.json` 是否可写，或 `ONEDRIVE_TOKEN_CACHE` 指向的路径 |
+| `/usr/bin/env: "bash\r": 没有那个文件或目录` | `onedrive-sync.sh` 是 CRLF（Windows 换行）；执行 `sed -i 's/\r$//' scripts/onedrive-sync.sh` 后再用 bash 跑 |
+| `set: pipefail` / `无效的选项名` | 用了 `sh` 而不是 `bash`；改为 `bash scripts/onedrive-sync.sh ...` |
 
 ---
 
@@ -284,6 +286,13 @@ java -jar .\target\onedrive-api-java-1.0.0.jar --tsv ls-recursive /
 ### Bash
 
 需要 Bash 4+（macOS 自带 3.2，请 `brew install bash`）。路径可含空格和中文。
+
+**务必用 `bash` 跑脚本，不要用 `sh`。** 脚本须为 Unix LF 换行。若从 Windows 拷到 Ubuntu 后出现 `/usr/bin/env: "bash\r": 没有那个文件或目录` 或 `set: pipefail` / `无效的选项名`，先转成 LF 再用 bash：
+
+```bash
+sed -i 's/\r$//' scripts/onedrive-sync.sh
+bash scripts/onedrive-sync.sh /data/onedrive-backup
+```
 
 ```bash
 # 可选

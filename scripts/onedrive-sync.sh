@@ -27,10 +27,20 @@
 #   3 some downloads failed (takes precedence over 5)
 #   5 verification FAIL (missing files or size mismatch)
 #
-# Requires Bash 4+.
+# Requires Bash 4+. Must run under bash with LF line endings (not sh/dash, not CRLF).
+# Check BASH_VERSION with POSIX syntax first: under dash, set -o pipefail fails
+# with "invalid option name" / 无效的选项名.
+# If you see /usr/bin/env: "bash\r": No such file — convert CRLF to LF:
+#   sed -i 's/\r$//' scripts/onedrive-sync.sh
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "ERROR: 请用 bash 运行本脚本（Ubuntu 上 sh 多为 dash，不支持 pipefail）。" >&2
+  echo "ERROR: Run with bash, not sh. Example:" >&2
+  echo "       bash $0 <localDest> [remoteRoot]" >&2
+  exit 1
+fi
 set -euo pipefail
 
-if [[ -z "${BASH_VERSINFO:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
   echo "ERROR: Bash 4+ required (macOS: brew install bash)" >&2
   exit 1
 fi
