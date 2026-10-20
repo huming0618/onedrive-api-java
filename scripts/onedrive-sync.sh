@@ -3,7 +3,8 @@
 # a final verification report (local vs. remote count / bytes).
 #
 # Usage:
-#   ./scripts/onedrive-sync.sh [--verify-only] <localDest> [remoteRoot]
+#   ./scripts/onedrive-sync.sh [--verify-only] [--daemon] <localDest> [remoteRoot]
+#   ./scripts/onedrive-sync.sh --status|--stop <localDest>
 #
 # Env:
 #   ONEDRIVE_JAR   path to fat jar (default: <repo>/target/onedrive-api-java-1.0.0.jar)
@@ -47,12 +48,19 @@ fi
 
 usage() {
   cat <<'USAGE'
-Usage: onedrive-sync.sh [--verify-only] <localDest> [remoteRoot]
+Usage: onedrive-sync.sh [--verify-only] [--daemon] <localDest> [remoteRoot]
+       onedrive-sync.sh --status <localDest>
+       onedrive-sync.sh --stop   <localDest>
 
   localDest      Local directory to receive files (created if missing)
   remoteRoot     OneDrive folder to sync (default: /)
   --verify-only  Do not download; only compare the existing manifest
                  (<dest>/.onedrive-sync/manifest.tsv) with local files
+  --daemon       Run in the background (setsid + nohup); keeps running after
+                 you log out or close the terminal/SSH session. Output goes to
+                 <dest>/.onedrive-sync/sync.log, PID to sync.pid
+  --status       Show whether a background sync is running, plus the log tail
+  --stop         Stop the background sync (re-run later to resume)
 
 Environment:
   ONEDRIVE_JAR              Fat jar path
@@ -77,13 +85,19 @@ USAGE
 
 VERIFY_ONLY=0
 [[ "${ONEDRIVE_VERIFY_ONLY:-0}" == "1" ]] && VERIFY_ONLY=1
+DAEMON=0
+ACTION=run
 POSITIONAL=()
+PASS_ARGS=()   # args forwarded to the background child (everything but --daemon)
 for arg in "$@"; do
   case "$arg" in
     -h|--help) usage; exit 0 ;;
-    --verify-only) VERIFY_ONLY=1 ;;
+    --verify-only) VERIFY_ONLY=1; PASS_ARGS+=("$arg") ;;
+    --daemon|-d) DAEMON=1 ;;
+    --status) ACTION=status ;;
+    --stop) ACTION=stop ;;
     -*) echo "ERROR: unknown option: $arg" >&2; usage >&2; exit 1 ;;
-    *) POSITIONAL+=("$arg") ;;
+    *) POSITIONAL+=("$arg"); PASS_ARGS+=("$arg") ;;
   esac
 done
 
@@ -108,6 +122,99 @@ REPORT_FILE="$STATE/verify-report.txt"
 MISSING_FILE="$STATE/missing.txt"
 MISMATCH_FILE="$STATE/size-mismatch.txt"
 EXTRA_FILE="$STATE/extra.txt"
+PID_FILE="$STATE/sync.pid"
+LOG_FILE="$STATE/sync.log"
+
+# ---------- daemon / status / stop ----------
+
+running_pid() {
+  # Prints the PID of a live background sync for this destination, if any.
+  local pid
+  [[ -s "$PID_FILE" ]] || return 1
+  pid=$(<"$PID_FILE")
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+if [[ "$ACTION" == "status" ]]; then
+  if pid=$(running_pid); then
+    echo "RUNNING: pid=$pid  log=$LOG_FILE"
+  else
+    echo "NOT RUNNING  (log: $LOG_FILE)"
+  fi
+  if [[ -f "$LOG_FILE" ]]; then
+    echo "----- last 15 log lines -----"
+    tail -n 15 "$LOG_FILE"
+  fi
+  exit 0
+fi
+
+if [[ "$ACTION" == "stop" ]]; then
+  if pid=$(running_pid); then
+    # Kill the whole process group (setsid made the script its leader),
+    # so the running java download stops too.
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    echo "Stopped background sync (pid=$pid). Re-run the same command to resume."
+  else
+    rm -f "$PID_FILE"
+    echo "No background sync running for $DEST"
+  fi
+  exit 0
+fi
+
+if [[ "$DAEMON" -eq 1 && "${ONEDRIVE_SYNC_CHILD:-0}" != "1" ]]; then
+  mkdir -p "$STATE"
+  if pid=$(running_pid); then
+    echo "ERROR: a background sync is already running (pid=$pid)." >&2
+    echo "       Check: bash $0 --status \"$DEST\"   Stop: bash $0 --stop \"$DEST\"" >&2
+    exit 1
+  fi
+  if [[ "$VERIFY_ONLY" -ne 1 && -f "$JAR" ]]; then
+    # Log in (or refresh) in the foreground first: a device-code prompt
+    # would otherwise be hidden in the background log.
+    echo "Auth check (foreground) ..." >&2
+    if ! "$JAVA_BIN" -jar "$JAR" auth >/dev/null; then
+      echo "ERROR: auth failed. Run: java -jar \"$JAR\" auth" >&2
+      exit 2
+    fi
+  fi
+  SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+  {
+    echo
+    echo "===== background sync started $(date '+%Y-%m-%d %H:%M:%S %Z') ====="
+  } >>"$LOG_FILE"
+  ONEDRIVE_SYNC_CHILD=1 ONEDRIVE_JAR="$JAR" ONEDRIVE_JAVA="$JAVA_BIN" \
+    setsid nohup bash "$SELF" "${PASS_ARGS[@]}" >>"$LOG_FILE" 2>&1 </dev/null &
+  child=$!
+  echo "$child" >"$PID_FILE"
+  sleep 1
+  if kill -0 "$child" 2>/dev/null; then
+    echo "Started background sync: pid=$child"
+  else
+    echo "WARN: background process exited right away; see log below" >&2
+  fi
+  echo "Log:    tail -f \"$LOG_FILE\""
+  echo "Status: bash \"$SELF\" --status \"$DEST\""
+  echo "Stop:   bash \"$SELF\" --stop \"$DEST\""
+  [[ -f "$LOG_FILE" ]] && tail -n 5 "$LOG_FILE"
+  exit 0
+fi
+
+if [[ "${ONEDRIVE_SYNC_CHILD:-0}" == "1" ]]; then
+  # Running as the background child: record our PID and clean it up on exit.
+  mkdir -p "$STATE"
+  echo "$$" >"$PID_FILE"
+  trap 'echo "===== background sync stopped (signal) $(date "+%Y-%m-%d %H:%M:%S %Z") ====="; exit 130' TERM INT
+fi
 
 # ---------- helpers ----------
 
@@ -241,6 +348,7 @@ if [[ "$VERIFY_ONLY" -eq 1 ]]; then
   fi
   rc=0
   verify || rc=$?
+  [[ "${ONEDRIVE_SYNC_CHILD:-0}" == "1" ]] && rm -f "$PID_FILE"
   exit "$rc"
 fi
 
@@ -300,7 +408,13 @@ ok=0
 skipped=0
 failed=0
 ERR_TMP="$(mktemp "${TMPDIR:-/tmp}/onedrive-sync-err.XXXXXX")"
-trap 'rm -f "$ERR_TMP"' EXIT
+cleanup() {
+  rm -f "$ERR_TMP"
+  if [[ "${ONEDRIVE_SYNC_CHILD:-0}" == "1" && -f "$PID_FILE" && "$(<"$PID_FILE")" == "$$" ]]; then
+    rm -f "$PID_FILE"
+  fi
+}
+trap cleanup EXIT
 
 while IFS=$'\t' read -r path size id lastModified kind name || [[ -n "${path:-}" ]]; do
   path="${path%$'\r'}"
@@ -341,7 +455,9 @@ echo >&2
 verify_rc=0
 verify || verify_rc=$?
 
-if [[ "$failed" -gt 0 ]]; then
-  exit 3
+final_rc="$verify_rc"
+[[ "$failed" -gt 0 ]] && final_rc=3
+if [[ "${ONEDRIVE_SYNC_CHILD:-0}" == "1" ]]; then
+  echo "===== background sync finished $(date '+%Y-%m-%d %H:%M:%S %Z') exit=$final_rc ====="
 fi
-exit "$verify_rc"
+exit "$final_rc"

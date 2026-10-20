@@ -311,6 +311,23 @@ bash scripts/onedrive-sync.sh --verify-only /data/onedrive-backup
 ONEDRIVE_VERIFY_ONLY=1 bash scripts/onedrive-sync.sh /data/onedrive-backup
 ```
 
+#### 后台运行（退出终端 / 断开 SSH 也不会停）
+
+加 `--daemon`：脚本先在前台检查登录（需要设备码时会在当前终端提示），然后用 `setsid nohup` 转到后台。输出写到 `<目标目录>/.onedrive-sync/sync.log`，PID 写到 `sync.pid`；同一目标目录不会重复启动两个。
+
+```bash
+# 后台启动
+bash scripts/onedrive-sync.sh --daemon /data/onedrive-backup
+# 看进度
+tail -f /data/onedrive-backup/.onedrive-sync/sync.log
+# 是否还在跑 + 最后几行日志
+bash scripts/onedrive-sync.sh --status /data/onedrive-backup
+# 停止（之后用同一条 --daemon 命令再启动即可续传）
+bash scripts/onedrive-sync.sh --stop /data/onedrive-backup
+```
+
+结束时日志最后会有 `background sync finished ... exit=<退出码>`，退出码含义同下文「脚本退出码」。注意：后台模式不能扛住机器重启，重启后再执行一次 `--daemon` 即可续传。
+
 进度示例（stderr）：`[123/4567] 2.7% Photos/a.jpg (102400 bytes)`
 
 ### PowerShell（Windows）
